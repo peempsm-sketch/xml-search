@@ -24,7 +24,7 @@ def load_config_from_js(path: str):
     # ลบ trailing comma ก่อน } หรือ ]
     obj = re.sub(r',\s*([}\]])', r'\1', obj)
 
-    # ใส่ quote ให้ key เฉพาะหลัง { หรือ ,
+    # ใส่ quote ให้ key เฉพาะหลัง { หรือ , เท่านั้น
     obj = re.sub(r'(?<=\{|,)\s*(\w+)\s*:', r'"\1":', obj)
 
     # แปลง ' -> "
@@ -34,15 +34,10 @@ def load_config_from_js(path: str):
 
 
 def file_matches_multi(xml_path, conditions, mode="AND", case_sensitive=True):
-    """
-    conditions: [{ "key": "TaxNumber", "value": "xxx" }, ...]
-    mode: "AND" or "OR"
-    """
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
 
-        # key -> set(values) ที่พบในไฟล์
         found = {}
         for el in root.iter():
             k = localname(el.tag)
@@ -61,7 +56,6 @@ def file_matches_multi(xml_path, conditions, mode="AND", case_sensitive=True):
             if not case_sensitive:
                 k = k.lower()
 
-            # รองรับทั้ง value เดียว และ values หลายค่า
             if "values" in cond:
                 vals = cond["values"]
                 if not case_sensitive:
@@ -84,21 +78,11 @@ def file_matches_multi(xml_path, conditions, mode="AND", case_sensitive=True):
 
 
 def normalize_conditions_from_config(config: dict):
-    """
-    รองรับ config 2 แบบ:
-    1) แบบใหม่:
-       mode: "AND"
-       conditions: [{key,value}, ...]
-    2) แบบเก่า:
-       search: { key, value }
-       -> แปลงเป็น conditions 1 อันให้
-    """
     mode = config.get("mode", "AND")
 
     if "conditions" in config and isinstance(config["conditions"], list) and config["conditions"]:
         return mode, config["conditions"]
 
-    # fallback แบบเก่า
     search = config.get("search", {})
     if isinstance(search, dict) and search.get("key") and search.get("value"):
         return mode, [{"key": search["key"], "value": search["value"]}]
@@ -106,36 +90,80 @@ def normalize_conditions_from_config(config: dict):
     raise ValueError("config.js ต้องมี conditions[] หรือ search.key/search.value")
 
 
+def unique_destination_path(output_dir: str, src_path: str) -> str:
+    base = os.path.basename(src_path)
+    name, ext = os.path.splitext(base)
+    dst = os.path.join(output_dir, base)
+
+    if not os.path.exists(dst):
+        return dst
+
+    i = 2
+    while True:
+        dst2 = os.path.join(output_dir, f"{name}_{i}{ext}")
+        if not os.path.exists(dst2):
+            return dst2
+        i += 1
+
+
+def to_abs(base_dir: str, p: str) -> str:
+    return p if os.path.isabs(p) else os.path.abspath(os.path.join(base_dir, p))
+
+
 def main():
     config = load_config_from_js("config.js")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    input_dir = config["inputDir"]
-    output_dir = config["outputDir"]
+    # ✅ รองรับทั้ง inputDir และ inputDirs
+    input_dirs = []
+    if "inputDirs" in config and isinstance(config["inputDirs"], list) and config["inputDirs"]:
+        input_dirs = [to_abs(base_dir, d) for d in config["inputDirs"]]
+    elif "inputDir" in config and isinstance(config["inputDir"], str) and config["inputDir"].strip():
+        input_dirs = [to_abs(base_dir, config["inputDir"])]
+    else:
+        raise ValueError("config.js ต้องมี inputDir (string) หรือ inputDirs (array)")
+
+    # outputDir
+    if "outputDir" not in config:
+        raise ValueError("config.js ต้องมี outputDir")
+    output_dir = to_abs(base_dir, config["outputDir"])
+
     case_sensitive = config.get("caseSensitive", True)
+    stop_after_first = config.get("stopAfterFirstMatch", True)
 
     mode, conditions = normalize_conditions_from_config(config)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    if not os.path.isdir(input_dir):
-        raise ValueError(f"inputDir ไม่ใช่โฟลเดอร์ หรือไม่พบ: {input_dir}")
+    # ✅ Debug (พิมพ์ก่อนเริ่มค้นหา จะได้เห็นค่าจริง)
 
-    files = [
-        os.path.join(input_dir, f)
-        for f in os.listdir(input_dir)
-        if f.lower().endswith(".xml")
-    ]
-
-    if not files:
-        print("ไม่พบไฟล์ .xml ในโฟลเดอร์ inputDir")
-        return
 
     matched = 0
-    for file_path in files:
-        if file_matches_multi(file_path, conditions, mode=mode, case_sensitive=case_sensitive):
-            shutil.copy2(file_path, os.path.join(output_dir, os.path.basename(file_path)))
-            matched += 1
-            print(f"[MATCH] {os.path.basename(file_path)}")
+
+    # ✅ ไล่ทีละโฟลเดอร์ตามลำดับใน inputDirs
+    for input_dir in input_dirs:
+        if not os.path.isdir(input_dir):
+            print(f"[WARN] ไม่พบโฟลเดอร์: {input_dir}")
+            continue
+
+        # ✅ เดินทุกโฟลเดอร์ย่อยด้วย os.walk()
+        for root_dir, dirs, filenames in os.walk(input_dir):
+            for f in filenames:
+                if not f.lower().endswith(".xml"):
+                    continue
+
+                file_path = os.path.join(root_dir, f)
+
+                if file_matches_multi(file_path, conditions, mode=mode, case_sensitive=case_sensitive):
+                    dst = unique_destination_path(output_dir, file_path)
+                    shutil.copy2(file_path, dst)
+                    matched += 1
+                    print(f"[MATCH] {file_path} -> {dst}")
+
+                    if stop_after_first:
+                        print("\nเจอไฟล์แรกแล้ว หยุดการค้นหา (stopAfterFirstMatch=true)")
+                        print(f"คัดลอกไว้ที่: {output_dir}")
+                        return
 
     print(f"\nเสร็จแล้ว พบ {matched} ไฟล์")
     print(f"คัดลอกไว้ที่: {output_dir}")
